@@ -11,9 +11,11 @@ import {
   AlertCircle,
   Trash2,
   Calendar,
-  X
+  X,
+  AlertTriangle
 } from 'lucide-react'
 import toast from 'react-hot-toast'
+import ConfirmModal from '@/components/ConfirmModal'
 
 interface Import {
   id: string
@@ -33,6 +35,8 @@ export default function InboxPage() {
   const [importName, setImportName] = useState('')
   const [pendingFile, setPendingFile] = useState<File | null>(null)
   const [deletingImportId, setDeletingImportId] = useState<string | null>(null)
+  const [showDeleteModal, setShowDeleteModal] = useState(false)
+  const [importToDelete, setImportToDelete] = useState<Import | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -191,36 +195,41 @@ export default function InboxPage() {
     }
   }
 
-  const handleDeleteImport = async (importId: string) => {
-    if (!confirm('This will delete all comments and insights from this import. Continue?')) {
-      return
-    }
+  const handleDeleteClick = (imp: Import) => {
+    setImportToDelete(imp)
+    setShowDeleteModal(true)
+  }
 
-    setDeletingImportId(importId)
+  const handleDeleteImport = async () => {
+    if (!importToDelete) return
+
+    setDeletingImportId(importToDelete.id)
 
     try {
       const supabase = createBrowserClient()
       
       // Delete clusters associated with this import
-      await supabase.from('clusters').delete().eq('import_id', importId)
+      await supabase.from('clusters').delete().eq('import_id', importToDelete.id)
       
       // Delete comments associated with this import
-      await supabase.from('comments').delete().eq('import_id', importId)
+      await supabase.from('comments').delete().eq('import_id', importToDelete.id)
       
       // Delete the import itself
-      const { error } = await supabase.from('imports').delete().eq('id', importId)
+      const { error } = await supabase.from('imports').delete().eq('id', importToDelete.id)
 
       if (error) {
         toast.error('Failed to delete import')
       } else {
-        toast.success('Import deleted')
-        setImports(imports.filter(i => i.id !== importId))
+        toast.success('Import deleted successfully')
+        setImports(imports.filter(i => i.id !== importToDelete.id))
       }
     } catch (error) {
       toast.error('Failed to delete import')
     }
 
     setDeletingImportId(null)
+    setShowDeleteModal(false)
+    setImportToDelete(null)
   }
 
   const formatDate = (dateString: string) => {
@@ -347,7 +356,7 @@ export default function InboxPage() {
                   </div>
                 </div>
                 <button
-                  onClick={() => handleDeleteImport(imp.id)}
+                  onClick={() => handleDeleteClick(imp)}
                   disabled={deletingImportId === imp.id}
                   className="p-2 text-slate-400 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
                   title="Delete import"
@@ -450,6 +459,34 @@ export default function InboxPage() {
           </div>
         </div>
       )}
+
+      {/* Delete Confirmation Modal */}
+      <ConfirmModal
+        isOpen={showDeleteModal}
+        title="Delete Import"
+        message={
+          <div className="space-y-2">
+            <p>Are you sure you want to delete <strong>"{importToDelete?.name}"</strong>?</p>
+            <p className="text-sm text-slate-500">
+              This will permanently delete {importToDelete?.comment_count} comments and any insights generated from them.
+            </p>
+          </div>
+        }
+        confirmText="Delete Import"
+        cancelText="Cancel"
+        confirmVariant="danger"
+        isLoading={deletingImportId !== null}
+        onConfirm={handleDeleteImport}
+        onCancel={() => {
+          setShowDeleteModal(false)
+          setImportToDelete(null)
+        }}
+        icon={
+          <div className="w-16 h-16 rounded-2xl bg-red-500/15 flex items-center justify-center">
+            <AlertTriangle className="w-8 h-8 text-red-400" />
+          </div>
+        }
+      />
     </div>
   )
 }

@@ -13,11 +13,13 @@ import {
   Upload,
   X,
   Filter,
-  Trash2
+  Trash2,
+  AlertTriangle
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import Link from 'next/link'
 import PaywallModal from '@/components/PaywallModal'
+import ConfirmModal from '@/components/ConfirmModal'
 
 interface Cluster {
   id: string
@@ -61,6 +63,7 @@ export default function InsightsPage() {
   const [selectedCluster, setSelectedCluster] = useState<Cluster | null>(null)
   const [showPaywall, setShowPaywall] = useState(false)
   const [showNoCommentsModal, setShowNoCommentsModal] = useState(false)
+  const [showResetModal, setShowResetModal] = useState(false)
   
   // Filters
   const [selectedPlatform, setSelectedPlatform] = useState<string>('all')
@@ -77,7 +80,6 @@ export default function InsightsPage() {
   const fetchData = async () => {
     const supabase = createBrowserClient()
 
-    // Fetch clusters with new fields
     const { data: clustersData } = await supabase
       .from('clusters')
       .select('*')
@@ -86,7 +88,6 @@ export default function InsightsPage() {
 
     setClusters(clustersData || [])
 
-    // Fetch imports for filter
     const { data: importsData } = await supabase
       .from('imports')
       .select('*')
@@ -94,7 +95,6 @@ export default function InsightsPage() {
 
     setImports(importsData || [])
 
-    // Fetch comment stats
     const { count: total } = await supabase
       .from('comments')
       .select('*', { count: 'exact', head: true })
@@ -104,7 +104,6 @@ export default function InsightsPage() {
       .select('*', { count: 'exact', head: true })
       .eq('is_processed', false)
 
-    // Get platform breakdown
     const { data: platformData } = await supabase
       .from('comments')
       .select('platform')
@@ -126,21 +125,18 @@ export default function InsightsPage() {
   const applyFilters = () => {
     let filtered = [...clusters]
 
-    // Filter by platform using the platforms array
     if (selectedPlatform !== 'all') {
       filtered = filtered.filter(c => 
         c.platforms?.includes(selectedPlatform) || c.primary_platform === selectedPlatform
       )
     }
 
-    // Filter by import using the import_ids array
     if (selectedImport !== 'all') {
       filtered = filtered.filter(c => 
         c.import_ids?.includes(selectedImport)
       )
     }
 
-    // Consolidate similar themes
     const consolidated = consolidateThemes(filtered)
     setFilteredClusters(consolidated)
   }
@@ -149,10 +145,8 @@ export default function InsightsPage() {
     const themeMap = new Map<string, Cluster>()
 
     clusterList.forEach(cluster => {
-      // Normalize theme name for comparison
       const normalizedTheme = cluster.theme.toLowerCase().trim()
       
-      // Find similar theme
       let matchedKey: string | null = null
       for (const key of Array.from(themeMap.keys())) {
         if (areSimilarThemes(normalizedTheme, key)) {
@@ -162,10 +156,9 @@ export default function InsightsPage() {
       }
 
       if (matchedKey) {
-        // Merge with existing
         const existing = themeMap.get(matchedKey)!
-const mergedPlatforms = Array.from(new Set([...(existing.platforms || []), ...(cluster.platforms || [])]))
-const mergedImportIds = Array.from(new Set([...(existing.import_ids || []), ...(cluster.import_ids || [])]))
+        const mergedPlatforms = Array.from(new Set([...(existing.platforms || []), ...(cluster.platforms || [])]))
+        const mergedImportIds = Array.from(new Set([...(existing.import_ids || []), ...(cluster.import_ids || [])]))
         
         themeMap.set(matchedKey, {
           ...existing,
@@ -176,7 +169,6 @@ const mergedImportIds = Array.from(new Set([...(existing.import_ids || []), ...(
           import_ids: mergedImportIds
         })
       } else {
-        // Add new
         themeMap.set(normalizedTheme, { ...cluster })
       }
     })
@@ -185,13 +177,9 @@ const mergedImportIds = Array.from(new Set([...(existing.import_ids || []), ...(
   }
 
   const areSimilarThemes = (theme1: string, theme2: string): boolean => {
-    // Check exact match first
     if (theme1 === theme2) return true
-    
-    // Check if one contains the other
     if (theme1.includes(theme2) || theme2.includes(theme1)) return true
     
-    // Check for significant word overlap
     const words1 = theme1.split(/\s+/).filter(w => w.length > 3)
     const words2 = theme2.split(/\s+/).filter(w => w.length > 3)
     
@@ -199,7 +187,6 @@ const mergedImportIds = Array.from(new Set([...(existing.import_ids || []), ...(
       words2.some(w2 => w2.includes(w) || w.includes(w2))
     )
     
-    // Need at least 2 common significant words
     return commonWords.length >= 2
   }
 
@@ -250,10 +237,6 @@ const mergedImportIds = Array.from(new Set([...(existing.import_ids || []), ...(
   }
 
   const handleResetInsights = async () => {
-    if (!confirm('This will delete all insight clusters. You can regenerate them from your comments. Continue?')) {
-      return
-    }
-
     setIsResetting(true)
 
     try {
@@ -262,10 +245,11 @@ const mergedImportIds = Array.from(new Set([...(existing.import_ids || []), ...(
       
       if (!user) {
         toast.error('Not authenticated')
+        setIsResetting(false)
+        setShowResetModal(false)
         return
       }
 
-      // Deactivate all clusters for this user
       const { error } = await supabase
         .from('clusters')
         .update({ is_active: false })
@@ -274,7 +258,6 @@ const mergedImportIds = Array.from(new Set([...(existing.import_ids || []), ...(
       if (error) {
         toast.error('Failed to reset insights')
       } else {
-        // Reset processed flag on comments so they can be re-analyzed
         await supabase
           .from('comments')
           .update({ is_processed: false, cluster_id: null })
@@ -290,6 +273,7 @@ const mergedImportIds = Array.from(new Set([...(existing.import_ids || []), ...(
     }
 
     setIsResetting(false)
+    setShowResetModal(false)
   }
 
   const platforms = Object.keys(stats.byPlatform)
@@ -315,7 +299,7 @@ const mergedImportIds = Array.from(new Set([...(existing.import_ids || []), ...(
         <div className="flex items-center gap-2">
           {clusters.length > 0 && (
             <button
-              onClick={handleResetInsights}
+              onClick={() => setShowResetModal(true)}
               disabled={isResetting}
               className="btn-secondary flex items-center gap-2"
               title="Reset all insights"
@@ -396,7 +380,6 @@ const mergedImportIds = Array.from(new Set([...(existing.import_ids || []), ...(
               <span className="text-sm text-slate-400">Filters:</span>
             </div>
 
-            {/* Platform Filter */}
             {platforms.length > 0 && (
               <div>
                 <select
@@ -414,7 +397,6 @@ const mergedImportIds = Array.from(new Set([...(existing.import_ids || []), ...(
               </div>
             )}
 
-            {/* Import Filter */}
             {imports.length > 0 && (
               <div>
                 <select
@@ -502,7 +484,6 @@ const mergedImportIds = Array.from(new Set([...(existing.import_ids || []), ...(
                 </p>
               )}
 
-              {/* Platform badges */}
               {cluster.platforms && cluster.platforms.length > 0 && (
                 <div className="flex flex-wrap gap-1 mb-3">
                   {cluster.platforms.slice(0, 3).map((platform, i) => (
@@ -546,7 +527,6 @@ const mergedImportIds = Array.from(new Set([...(existing.import_ids || []), ...(
               <div>
                 <h2 className="text-xl font-bold">{selectedCluster.theme}</h2>
                 <p className="text-sm text-slate-500">{selectedCluster.comment_count} comments in this cluster</p>
-                {/* Platform badges in modal */}
                 {selectedCluster.platforms && selectedCluster.platforms.length > 0 && (
                   <div className="flex flex-wrap gap-1 mt-2">
                     {selectedCluster.platforms.map((platform, i) => (
@@ -660,6 +640,29 @@ const mergedImportIds = Array.from(new Set([...(existing.import_ids || []), ...(
           </div>
         </div>
       )}
+
+      {/* Reset Confirmation Modal */}
+      <ConfirmModal
+        isOpen={showResetModal}
+        title="Reset All Insights"
+        message={
+          <div className="space-y-2">
+            <p>This will delete all insight clusters and allow you to regenerate them from your comments.</p>
+            <p className="text-sm text-slate-500">Your imported comments will not be deleted.</p>
+          </div>
+        }
+        confirmText="Reset Insights"
+        cancelText="Cancel"
+        confirmVariant="danger"
+        isLoading={isResetting}
+        onConfirm={handleResetInsights}
+        onCancel={() => setShowResetModal(false)}
+        icon={
+          <div className="w-16 h-16 rounded-2xl bg-red-500/15 flex items-center justify-center">
+            <AlertTriangle className="w-8 h-8 text-red-400" />
+          </div>
+        }
+      />
 
       {/* Paywall Modal */}
       <PaywallModal
