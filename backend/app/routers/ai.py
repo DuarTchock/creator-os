@@ -1,0 +1,309 @@
+"""
+AI router - Pitch generation and comment clustering using Groq (Llama 3.3)
+Uses admin client with manual user_id filtering for security
+"""
+
+from fastapi import APIRouter, HTTPException, Depends, status, BackgroundTasks
+from typing import Optional, List
+from uuid import UUID
+from decimal import Decimal
+from datetime import datetime
+import os
+import json
+
+from app.database import get_supabase_admin
+from app.routers.auth import get_current_user
+from app.schemas import (
+    PitchGenerateRequest,
+    PitchGenerateResponse,
+    ClusterAnalysisRequest,
+    ClusterAnalysisResponse,
+    InsightBriefRequest,
+    InsightBriefResponse,
+    ClusterResponse,
+    ContentIdea,
+    SuccessResponse
+)
+
+router = APIRouter()
+
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+
+def get_groq_api_key() -> str:
+    return os.getenv("GROQ_API_KEY", "")
+
+
+async def call_groq(prompt: str, system_prompt: str = None, max_tokens: int = 2000) -> str:
+    groq_api_key = get_groq_api_key()
+    
+    if not groq_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="AI service not configured. Please set GROQ_API_KEY."
+        )
+    
+    try:
+        import httpx
+        
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {groq_api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.7
+                }
+            )
+            
+            if response.status_code != 200:
+                print(f"Groq Error: {response.text}")
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"AI service error: {response.text}"
+                )
+            
+            result = response.json()
+            return result["choices"][0]["message"]["content"]
+            
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="AI timeout")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"AI error: {str(e)}")
+
+
+@router.post("/generate-pitch", response_model=PitchGenerateResponse)
+async def generate_pitch(request: PitchGenerateRequest, current_user: dict = Depends(get_current_user)):
+    user_id = current_user["id"]
+    supabase = get_supabase_admin()
+    
+    creator_name = request.creator_name
+    if not creator_name:
+        profile = supabase.table("profiles").select("full_name").eq("id", user_id).single().execute()
+        creator_name = profile.data.get("full_name", "Creator") if profile.data else "Creator"
+    
+    tone_instructions = {
+        "professional": "Write in a professional, business-like tone.",
+        "friendly": "Write in a friendly, warm, and approachable tone.",
+        "enthusiastic": "Write with enthusiasm and energy.",
+        "concise": "Keep it brief, maximum 150 words."
+    }
+    tone_instruction = tone_instructions.get(request.tone, tone_instructions["professional"])
+    
+    system_prompt = f"""You are an expert at writing brand deal pitch emails for social media influencers. 
+{tone_instruction}
+Write the email directly without any JSON formatting."""
+
+    prompt = f"""Write a brand deal pitch email:
+Brand: {request.brand_name}
+Category: {request.brand_category or "Not specified"}
+Creator: {creator_name}
+Niche: {request.creator_niche or "Lifestyle"}
+Followers: {request.follower_count or "Not specified"}
+Value: {request.unique_value or "Engaging content"}
+
+Write a compelling pitch email."""
+
+    try:
+        response_text = await call_groq(prompt, system_prompt)
+        return PitchGenerateResponse(
+            pitch=response_text,
+            subject_line=f"Partnership Opportunity - {creator_name}",
+            key_points=["AI-generated pitch ready"],
+            suggested_rate=request.deal_amount,
+            confidence_score=0.85
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
+
+
+@router.post("/cluster-comments", response_model=ClusterAnalysisResponse)
+async def cluster_comments(request: ClusterAnalysisRequest, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
+    user_id = current_user["id"]
+    supabase = get_supabase_admin()
+    
+    try:
+        query = supabase.table("comments").select("id, content, platform").eq("user_id", user_id)
+        
+        if request.comment_ids:
+            query = query.in_("id", [str(id) for id in request.comment_ids])
+        else:
+            query = query.eq("is_processed", False)
+        
+        response = query.limit(500).execute()
+        comments = response.data or []
+        
+        print(f"Found {len(comments)} comments for user {user_id}")
+        
+        if len(comments) < request.min_cluster_size:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Not enough comments. Need {request.min_cluster_size}, found {len(comments)}."
+            )
+        
+        comments_text = "\n".join([f"- {c['content']}" for c in comments[:200]])
+        
+        system_prompt = """You are an expert at analyzing audience feedback for content creators.
+Group similar comments and provide actionable insights."""
+
+        prompt = f"""Analyze these comments and group into {request.num_clusters} themes:
+
+{comments_text}
+
+Respond in JSON:
+{{"clusters": [{{"theme": "string", "summary": "string", "sample_comments": ["string"], "content_ideas": [{{"title": "string", "description": "string", "content_type": "video"}}]}}]}}"""
+
+        response_text = await call_groq(prompt, system_prompt, max_tokens=3000)
+        
+        try:
+            cleaned = response_text.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```")[1]
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]
+            cleaned = cleaned.strip()
+            result = json.loads(cleaned)
+            clusters_data = result.get("clusters", [])
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=500, detail="Failed to parse AI response")
+        
+        created_clusters = []
+        for cluster_data in clusters_data:
+            content_ideas = cluster_data.get("content_ideas", [])
+            if content_ideas and isinstance(content_ideas[0], dict):
+                content_ideas = [{"title": i.get("title", ""), "description": i.get("description", ""), "content_type": i.get("content_type", "video")} for i in content_ideas]
+            
+            cluster_insert = {
+                "user_id": user_id,
+                "theme": cluster_data.get("theme", "Theme"),
+                "summary": cluster_data.get("summary", ""),
+                "sample_comments": cluster_data.get("sample_comments", []),
+                "content_ideas": content_ideas,
+                "comment_count": len(cluster_data.get("sample_comments", [])),
+                "is_active": True
+            }
+            
+            insert_response = supabase.table("clusters").insert(cluster_insert).execute()
+            if insert_response.data:
+                created_clusters.append(ClusterResponse(**insert_response.data[0]))
+        
+        comment_ids = [c["id"] for c in comments]
+        supabase.table("comments").update({"is_processed": True}).in_("id", comment_ids).execute()
+        
+        return ClusterAnalysisResponse(
+            clusters_created=len(created_clusters),
+            comments_processed=len(comments),
+            clusters=created_clusters
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
+
+
+@router.post("/generate-brief", response_model=InsightBriefResponse)
+async def generate_insight_brief(request: InsightBriefRequest, current_user: dict = Depends(get_current_user)):
+    user_id = current_user["id"]
+    supabase = get_supabase_admin()
+    
+    try:
+        brief_data = {"deals": [], "clusters": [], "comment_count": 0}
+        
+        if request.include_deals:
+            deals_response = supabase.table("deals").select("brand_name, status, amount, category").eq("user_id", user_id).limit(10).execute()
+            brief_data["deals"] = deals_response.data or []
+        
+        if request.include_comments:
+            clusters_response = supabase.table("clusters").select("theme, summary, comment_count").eq("user_id", user_id).eq("is_active", True).limit(5).execute()
+            brief_data["clusters"] = clusters_response.data or []
+            
+            comments_response = supabase.table("comments").select("id", count="exact").eq("user_id", user_id).execute()
+            brief_data["comment_count"] = comments_response.count or 0
+        
+        prompt = f"""Generate insight brief:
+Deals: {json.dumps(brief_data['deals'])}
+Themes: {json.dumps(brief_data['clusters'])}
+
+Respond in JSON:
+{{"summary": "string", "top_questions": ["string"], "content_ideas": [{{"title": "string", "description": "string", "content_type": "video", "priority": 1}}], "deal_highlights": ["string"], "action_items": ["string"]}}"""
+
+        response_text = await call_groq(prompt, max_tokens=2000)
+        
+        try:
+            cleaned = response_text.strip()
+            if "```" in cleaned:
+                cleaned = cleaned.split("```")[1].replace("json", "").strip()
+            result = json.loads(cleaned)
+            
+            content_ideas = [ContentIdea(title=i.get("title", ""), description=i.get("description", ""), content_type=i.get("content_type", "video"), priority=i.get("priority", 3)) for i in result.get("content_ideas", [])]
+            
+            return InsightBriefResponse(
+                summary=result.get("summary", "Brief ready."),
+                top_questions=result.get("top_questions", []),
+                content_ideas=content_ideas,
+                deal_highlights=result.get("deal_highlights", []),
+                action_items=result.get("action_items", []),
+                generated_at=datetime.utcnow()
+            )
+        except:
+            return InsightBriefResponse(summary=response_text[:500], top_questions=[], content_ideas=[], deal_highlights=[], action_items=[], generated_at=datetime.utcnow())
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
+
+
+@router.post("/analyze-sentiment")
+async def analyze_sentiment(comment_ids: List[UUID], current_user: dict = Depends(get_current_user)):
+    user_id = current_user["id"]
+    supabase = get_supabase_admin()
+    
+    try:
+        response = supabase.table("comments").select("id, content").eq("user_id", user_id).in_("id", [str(id) for id in comment_ids]).execute()
+        comments = response.data or []
+        
+        if not comments:
+            raise HTTPException(status_code=404, detail="No comments found")
+        
+        comments_text = "\n".join([f"ID:{c['id']} - {c['content']}" for c in comments])
+        prompt = f"""Analyze sentiment (positive/negative/neutral/question):
+{comments_text}
+Respond: {{"sentiments": {{"id": "sentiment"}}}}"""
+
+        response_text = await call_groq(prompt, max_tokens=1000)
+        
+        try:
+            cleaned = response_text.strip()
+            if "```" in cleaned:
+                cleaned = cleaned.split("```")[1].replace("json", "").strip()
+            result = json.loads(cleaned)
+            sentiments = result.get("sentiments", {})
+            
+            for comment_id, sentiment in sentiments.items():
+                if sentiment in ["positive", "negative", "neutral", "question"]:
+                    supabase.table("comments").update({"sentiment": sentiment}).eq("id", comment_id).eq("user_id", user_id).execute()
+            
+            return {"updated": len(sentiments), "sentiments": sentiments}
+        except:
+            raise HTTPException(status_code=500, detail="Failed to parse")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
