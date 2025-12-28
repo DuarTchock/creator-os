@@ -21,7 +21,7 @@ from fastapi.security import HTTPBearer
 from contextlib import asynccontextmanager
 
 # Import routers
-from app.routers import auth, deals, comments, insights, integrations, ai
+from app.routers import auth, deals, comments, insights, integrations, ai, stripe
 
 # Import database
 from app.database import init_db
@@ -66,6 +66,7 @@ app.include_router(comments.router, prefix="/api/comments", tags=["Comments"])
 app.include_router(insights.router, prefix="/api/insights", tags=["Insights"])
 app.include_router(integrations.router, prefix="/api/integrations", tags=["Integrations"])
 app.include_router(ai.router, prefix="/api/ai", tags=["AI"])
+app.include_router(stripe.router, prefix="/api/stripe", tags=["Stripe"])
 
 # Health check endpoint
 @app.get("/", tags=["Health"])
