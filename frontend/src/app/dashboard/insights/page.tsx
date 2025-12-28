@@ -11,7 +11,9 @@ import {
   RefreshCw,
   ChevronRight,
   Upload,
-  X
+  X,
+  Filter,
+  Trash2
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import Link from 'next/link'
@@ -28,6 +30,17 @@ interface Cluster {
     description: string
     content_type: string
   }>
+  primary_platform: string | null
+  platforms: string[]
+  import_ids: string[]
+  created_at: string
+}
+
+interface Import {
+  id: string
+  name: string
+  platform: string
+  comment_count: number
   created_at: string
 }
 
@@ -39,21 +52,32 @@ interface CommentStats {
 
 export default function InsightsPage() {
   const [clusters, setClusters] = useState<Cluster[]>([])
+  const [filteredClusters, setFilteredClusters] = useState<Cluster[]>([])
+  const [imports, setImports] = useState<Import[]>([])
   const [stats, setStats] = useState<CommentStats>({ total: 0, unprocessed: 0, byPlatform: {} })
   const [isLoading, setIsLoading] = useState(true)
   const [isGenerating, setIsGenerating] = useState(false)
+  const [isResetting, setIsResetting] = useState(false)
   const [selectedCluster, setSelectedCluster] = useState<Cluster | null>(null)
   const [showPaywall, setShowPaywall] = useState(false)
   const [showNoCommentsModal, setShowNoCommentsModal] = useState(false)
+  
+  // Filters
+  const [selectedPlatform, setSelectedPlatform] = useState<string>('all')
+  const [selectedImport, setSelectedImport] = useState<string>('all')
 
   useEffect(() => {
     fetchData()
   }, [])
 
+  useEffect(() => {
+    applyFilters()
+  }, [clusters, selectedPlatform, selectedImport])
+
   const fetchData = async () => {
     const supabase = createBrowserClient()
 
-    // Fetch clusters
+    // Fetch clusters with new fields
     const { data: clustersData } = await supabase
       .from('clusters')
       .select('*')
@@ -61,6 +85,14 @@ export default function InsightsPage() {
       .order('comment_count', { ascending: false })
 
     setClusters(clustersData || [])
+
+    // Fetch imports for filter
+    const { data: importsData } = await supabase
+      .from('imports')
+      .select('*')
+      .order('created_at', { ascending: false })
+
+    setImports(importsData || [])
 
     // Fetch comment stats
     const { count: total } = await supabase
@@ -72,17 +104,106 @@ export default function InsightsPage() {
       .select('*', { count: 'exact', head: true })
       .eq('is_processed', false)
 
+    // Get platform breakdown
+    const { data: platformData } = await supabase
+      .from('comments')
+      .select('platform')
+    
+    const byPlatform: Record<string, number> = {}
+    platformData?.forEach(c => {
+      byPlatform[c.platform] = (byPlatform[c.platform] || 0) + 1
+    })
+
     setStats({
       total: total || 0,
       unprocessed: unprocessed || 0,
-      byPlatform: {}
+      byPlatform
     })
 
     setIsLoading(false)
   }
 
+  const applyFilters = () => {
+    let filtered = [...clusters]
+
+    // Filter by platform using the platforms array
+    if (selectedPlatform !== 'all') {
+      filtered = filtered.filter(c => 
+        c.platforms?.includes(selectedPlatform) || c.primary_platform === selectedPlatform
+      )
+    }
+
+    // Filter by import using the import_ids array
+    if (selectedImport !== 'all') {
+      filtered = filtered.filter(c => 
+        c.import_ids?.includes(selectedImport)
+      )
+    }
+
+    // Consolidate similar themes
+    const consolidated = consolidateThemes(filtered)
+    setFilteredClusters(consolidated)
+  }
+
+  const consolidateThemes = (clusterList: Cluster[]): Cluster[] => {
+    const themeMap = new Map<string, Cluster>()
+
+    clusterList.forEach(cluster => {
+      // Normalize theme name for comparison
+      const normalizedTheme = cluster.theme.toLowerCase().trim()
+      
+      // Find similar theme
+      let matchedKey: string | null = null
+      for (const key of Array.from(themeMap.keys())) {
+        if (areSimilarThemes(normalizedTheme, key)) {
+          matchedKey = key
+          break
+        }
+      }
+
+      if (matchedKey) {
+        // Merge with existing
+        const existing = themeMap.get(matchedKey)!
+const mergedPlatforms = Array.from(new Set([...(existing.platforms || []), ...(cluster.platforms || [])]))
+const mergedImportIds = Array.from(new Set([...(existing.import_ids || []), ...(cluster.import_ids || [])]))
+        
+        themeMap.set(matchedKey, {
+          ...existing,
+          comment_count: existing.comment_count + cluster.comment_count,
+          sample_comments: [...existing.sample_comments, ...cluster.sample_comments].slice(0, 5),
+          content_ideas: [...existing.content_ideas, ...cluster.content_ideas].slice(0, 4),
+          platforms: mergedPlatforms,
+          import_ids: mergedImportIds
+        })
+      } else {
+        // Add new
+        themeMap.set(normalizedTheme, { ...cluster })
+      }
+    })
+
+    return Array.from(themeMap.values()).sort((a, b) => b.comment_count - a.comment_count)
+  }
+
+  const areSimilarThemes = (theme1: string, theme2: string): boolean => {
+    // Check exact match first
+    if (theme1 === theme2) return true
+    
+    // Check if one contains the other
+    if (theme1.includes(theme2) || theme2.includes(theme1)) return true
+    
+    // Check for significant word overlap
+    const words1 = theme1.split(/\s+/).filter(w => w.length > 3)
+    const words2 = theme2.split(/\s+/).filter(w => w.length > 3)
+    
+    const commonWords = words1.filter(w => 
+      words2.some(w2 => w2.includes(w) || w.includes(w2))
+    )
+    
+    // Need at least 2 common significant words
+    return commonWords.length >= 2
+  }
+
   const handleGenerateInsights = async () => {
-    // Show modal if not enough unprocessed comments
     if (stats.unprocessed < 3) {
       setShowNoCommentsModal(true)
       return
@@ -106,7 +227,6 @@ export default function InsightsPage() {
         })
       })
 
-      // Check for 402 Payment Required - show paywall
       if (response.status === 402) {
         setShowPaywall(true)
         setIsGenerating(false)
@@ -129,6 +249,51 @@ export default function InsightsPage() {
     setIsGenerating(false)
   }
 
+  const handleResetInsights = async () => {
+    if (!confirm('This will delete all insight clusters. You can regenerate them from your comments. Continue?')) {
+      return
+    }
+
+    setIsResetting(true)
+
+    try {
+      const supabase = createBrowserClient()
+      const { data: { user } } = await supabase.auth.getUser()
+      
+      if (!user) {
+        toast.error('Not authenticated')
+        return
+      }
+
+      // Deactivate all clusters for this user
+      const { error } = await supabase
+        .from('clusters')
+        .update({ is_active: false })
+        .eq('user_id', user.id)
+
+      if (error) {
+        toast.error('Failed to reset insights')
+      } else {
+        // Reset processed flag on comments so they can be re-analyzed
+        await supabase
+          .from('comments')
+          .update({ is_processed: false, cluster_id: null })
+          .eq('user_id', user.id)
+
+        toast.success('Insights reset! You can now regenerate them.')
+        setClusters([])
+        setFilteredClusters([])
+        fetchData()
+      }
+    } catch (error) {
+      toast.error('Failed to reset insights')
+    }
+
+    setIsResetting(false)
+  }
+
+  const platforms = Object.keys(stats.byPlatform)
+
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -147,23 +312,40 @@ export default function InsightsPage() {
             Discover patterns in your audience feedback
           </p>
         </div>
-        <button
-          onClick={handleGenerateInsights}
-          disabled={isGenerating}
-          className="btn-primary flex items-center gap-2"
-        >
-          {isGenerating ? (
-            <>
-              <Loader2 className="w-5 h-5 animate-spin" />
-              Analyzing...
-            </>
-          ) : (
-            <>
-              <Sparkles className="w-5 h-5" />
-              Generate Insights
-            </>
+        <div className="flex items-center gap-2">
+          {clusters.length > 0 && (
+            <button
+              onClick={handleResetInsights}
+              disabled={isResetting}
+              className="btn-secondary flex items-center gap-2"
+              title="Reset all insights"
+            >
+              {isResetting ? (
+                <Loader2 className="w-5 h-5 animate-spin" />
+              ) : (
+                <Trash2 className="w-5 h-5" />
+              )}
+              <span className="hidden sm:inline">Reset</span>
+            </button>
           )}
-        </button>
+          <button
+            onClick={handleGenerateInsights}
+            disabled={isGenerating}
+            className="btn-primary flex items-center gap-2"
+          >
+            {isGenerating ? (
+              <>
+                <Loader2 className="w-5 h-5 animate-spin" />
+                Analyzing...
+              </>
+            ) : (
+              <>
+                <Sparkles className="w-5 h-5" />
+                Generate Insights
+              </>
+            )}
+          </button>
+        </div>
       </div>
 
       {/* Stats */}
@@ -198,30 +380,106 @@ export default function InsightsPage() {
               <Lightbulb className="w-5 h-5 text-green-400" />
             </div>
             <div>
-              <p className="text-2xl font-bold">{clusters.length}</p>
+              <p className="text-2xl font-bold">{filteredClusters.length}</p>
               <p className="text-xs text-slate-500">Insight Clusters</p>
             </div>
           </div>
         </div>
       </div>
 
+      {/* Filters */}
+      {(clusters.length > 0 || imports.length > 0) && (
+        <div className="card p-4">
+          <div className="flex flex-wrap items-center gap-4">
+            <div className="flex items-center gap-2">
+              <Filter className="w-4 h-4 text-slate-400" />
+              <span className="text-sm text-slate-400">Filters:</span>
+            </div>
+
+            {/* Platform Filter */}
+            {platforms.length > 0 && (
+              <div>
+                <select
+                  value={selectedPlatform}
+                  onChange={(e) => setSelectedPlatform(e.target.value)}
+                  className="input text-sm py-1.5"
+                >
+                  <option value="all">All Platforms</option>
+                  {platforms.map(platform => (
+                    <option key={platform} value={platform}>
+                      {platform.charAt(0).toUpperCase() + platform.slice(1)} ({stats.byPlatform[platform]})
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {/* Import Filter */}
+            {imports.length > 0 && (
+              <div>
+                <select
+                  value={selectedImport}
+                  onChange={(e) => setSelectedImport(e.target.value)}
+                  className="input text-sm py-1.5"
+                >
+                  <option value="all">All Imports</option>
+                  {imports.map(imp => (
+                    <option key={imp.id} value={imp.id}>
+                      {imp.name} ({imp.comment_count})
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {(selectedPlatform !== 'all' || selectedImport !== 'all') && (
+              <button
+                onClick={() => {
+                  setSelectedPlatform('all')
+                  setSelectedImport('all')
+                }}
+                className="text-xs text-primary-400 hover:text-primary-300"
+              >
+                Clear filters
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Clusters */}
-      {clusters.length === 0 ? (
+      {filteredClusters.length === 0 ? (
         <div className="card p-12 text-center">
           <div className="w-20 h-20 rounded-2xl bg-dark-tertiary flex items-center justify-center mx-auto mb-6">
             <Sparkles className="w-10 h-10 text-slate-500" />
           </div>
-          <h2 className="text-xl font-bold mb-2">No insights yet</h2>
+          <h2 className="text-xl font-bold mb-2">
+            {clusters.length > 0 && (selectedPlatform !== 'all' || selectedImport !== 'all') 
+              ? 'No insights match your filters' 
+              : 'No insights yet'}
+          </h2>
           <p className="text-slate-400 mb-6 max-w-md mx-auto">
-            Import some comments in the Inbox Brain section, then click "Generate Insights" 
-            to let AI analyze and cluster your audience feedback.
+            {clusters.length > 0 && (selectedPlatform !== 'all' || selectedImport !== 'all')
+              ? 'Try adjusting your filters or generate new insights.'
+              : 'Import some comments in the Inbox Brain section, then click "Generate Insights" to let AI analyze and cluster your audience feedback.'}
           </p>
+          {clusters.length > 0 && (selectedPlatform !== 'all' || selectedImport !== 'all') && (
+            <button
+              onClick={() => {
+                setSelectedPlatform('all')
+                setSelectedImport('all')
+              }}
+              className="btn-secondary"
+            >
+              Clear Filters
+            </button>
+          )}
         </div>
       ) : (
         <div className="grid md:grid-cols-2 gap-6">
-          {clusters.map((cluster) => (
+          {filteredClusters.map((cluster, index) => (
             <div
-              key={cluster.id}
+              key={cluster.id + '-' + index}
               className="card p-6 hover:border-primary-500/30 transition-all cursor-pointer"
               onClick={() => setSelectedCluster(cluster)}
             >
@@ -242,6 +500,25 @@ export default function InsightsPage() {
                 <p className="text-sm text-slate-400 mb-4 line-clamp-2">
                   {cluster.summary}
                 </p>
+              )}
+
+              {/* Platform badges */}
+              {cluster.platforms && cluster.platforms.length > 0 && (
+                <div className="flex flex-wrap gap-1 mb-3">
+                  {cluster.platforms.slice(0, 3).map((platform, i) => (
+                    <span 
+                      key={i} 
+                      className={`text-xs px-2 py-0.5 rounded ${
+                        platform === 'youtube' ? 'bg-red-500/15 text-red-400' :
+                        platform === 'instagram' ? 'bg-pink-500/15 text-pink-400' :
+                        platform === 'tiktok' ? 'bg-cyan-500/15 text-cyan-400' :
+                        'bg-slate-500/15 text-slate-400'
+                      }`}
+                    >
+                      {platform}
+                    </span>
+                  ))}
+                </div>
               )}
 
               {cluster.content_ideas && cluster.content_ideas.length > 0 && (
@@ -269,6 +546,24 @@ export default function InsightsPage() {
               <div>
                 <h2 className="text-xl font-bold">{selectedCluster.theme}</h2>
                 <p className="text-sm text-slate-500">{selectedCluster.comment_count} comments in this cluster</p>
+                {/* Platform badges in modal */}
+                {selectedCluster.platforms && selectedCluster.platforms.length > 0 && (
+                  <div className="flex flex-wrap gap-1 mt-2">
+                    {selectedCluster.platforms.map((platform, i) => (
+                      <span 
+                        key={i} 
+                        className={`text-xs px-2 py-0.5 rounded ${
+                          platform === 'youtube' ? 'bg-red-500/15 text-red-400' :
+                          platform === 'instagram' ? 'bg-pink-500/15 text-pink-400' :
+                          platform === 'tiktok' ? 'bg-cyan-500/15 text-cyan-400' :
+                          'bg-slate-500/15 text-slate-400'
+                        }`}
+                      >
+                        {platform}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
               <button
                 onClick={() => setSelectedCluster(null)}

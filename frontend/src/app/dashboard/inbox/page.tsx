@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { createBrowserClient } from '@/lib/supabase'
 import { 
   Upload, 
@@ -8,16 +8,51 @@ import {
   FileText,
   Loader2,
   CheckCircle,
-  AlertCircle
+  AlertCircle,
+  Trash2,
+  Calendar,
+  X
 } from 'lucide-react'
 import toast from 'react-hot-toast'
+
+interface Import {
+  id: string
+  name: string
+  file_name: string | null
+  platform: string
+  comment_count: number
+  created_at: string
+}
 
 export default function InboxPage() {
   const [isUploading, setIsUploading] = useState(false)
   const [uploadResult, setUploadResult] = useState<{ success: number; failed: number } | null>(null)
+  const [imports, setImports] = useState<Import[]>([])
+  const [isLoadingImports, setIsLoadingImports] = useState(true)
+  const [showNameModal, setShowNameModal] = useState(false)
+  const [importName, setImportName] = useState('')
+  const [pendingFile, setPendingFile] = useState<File | null>(null)
+  const [deletingImportId, setDeletingImportId] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  useEffect(() => {
+    fetchImports()
+  }, [])
+
+  const fetchImports = async () => {
+    const supabase = createBrowserClient()
+    const { data, error } = await supabase
+      .from('imports')
+      .select('*')
+      .order('created_at', { ascending: false })
+
+    if (!error && data) {
+      setImports(data)
+    }
+    setIsLoadingImports(false)
+  }
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
 
@@ -26,11 +61,23 @@ export default function InboxPage() {
       return
     }
 
+    setPendingFile(file)
+    setImportName(file.name.replace('.csv', ''))
+    setShowNameModal(true)
+  }
+
+  const handleFileUpload = async () => {
+    if (!pendingFile || !importName.trim()) {
+      toast.error('Please enter a name for this import')
+      return
+    }
+
+    setShowNameModal(false)
     setIsUploading(true)
     setUploadResult(null)
 
     try {
-      const text = await file.text()
+      const text = await pendingFile.text()
       const lines = text.split('\n').filter(line => line.trim())
       
       if (lines.length < 2) {
@@ -60,6 +107,34 @@ export default function InboxPage() {
         return
       }
 
+      // Detect platform from file or column
+      let detectedPlatform = 'csv'
+      if (platformIndex !== -1) {
+        const firstPlatform = lines[1]?.split(',')[platformIndex]?.trim().toLowerCase()
+        if (firstPlatform && ['youtube', 'instagram', 'tiktok', 'twitter', 'facebook'].includes(firstPlatform)) {
+          detectedPlatform = firstPlatform
+        }
+      }
+
+      // Create import record first
+      const { data: importRecord, error: importError } = await supabase
+        .from('imports')
+        .insert({
+          user_id: user.id,
+          name: importName.trim(),
+          file_name: pendingFile.name,
+          platform: detectedPlatform,
+          comment_count: 0
+        })
+        .select()
+        .single()
+
+      if (importError || !importRecord) {
+        toast.error('Failed to create import record')
+        setIsUploading(false)
+        return
+      }
+
       const comments = []
       let failed = 0
 
@@ -74,14 +149,15 @@ export default function InboxPage() {
 
         comments.push({
           user_id: user.id,
+          import_id: importRecord.id,
           content: content,
-          platform: platformIndex !== -1 ? (values[platformIndex] || 'other').toLowerCase() : 'other',
+          platform: platformIndex !== -1 ? (values[platformIndex] || detectedPlatform).toLowerCase() : detectedPlatform,
           author_name: authorIndex !== -1 ? values[authorIndex] : null,
           is_processed: false,
         })
       }
 
-      // Batch insert
+      // Batch insert comments
       const { error } = await supabase
         .from('comments')
         .insert(comments)
@@ -89,9 +165,18 @@ export default function InboxPage() {
       if (error) {
         toast.error('Failed to import comments')
         console.error(error)
+        // Delete the import record if comments failed
+        await supabase.from('imports').delete().eq('id', importRecord.id)
       } else {
+        // Update import with actual count
+        await supabase
+          .from('imports')
+          .update({ comment_count: comments.length })
+          .eq('id', importRecord.id)
+
         toast.success(`Imported ${comments.length} comments!`)
         setUploadResult({ success: comments.length, failed })
+        fetchImports()
       }
     } catch (error) {
       toast.error('Failed to parse CSV file')
@@ -99,8 +184,62 @@ export default function InboxPage() {
     }
 
     setIsUploading(false)
+    setPendingFile(null)
+    setImportName('')
     if (fileInputRef.current) {
       fileInputRef.current.value = ''
+    }
+  }
+
+  const handleDeleteImport = async (importId: string) => {
+    if (!confirm('This will delete all comments and insights from this import. Continue?')) {
+      return
+    }
+
+    setDeletingImportId(importId)
+
+    try {
+      const supabase = createBrowserClient()
+      
+      // Delete clusters associated with this import
+      await supabase.from('clusters').delete().eq('import_id', importId)
+      
+      // Delete comments associated with this import
+      await supabase.from('comments').delete().eq('import_id', importId)
+      
+      // Delete the import itself
+      const { error } = await supabase.from('imports').delete().eq('id', importId)
+
+      if (error) {
+        toast.error('Failed to delete import')
+      } else {
+        toast.success('Import deleted')
+        setImports(imports.filter(i => i.id !== importId))
+      }
+    } catch (error) {
+      toast.error('Failed to delete import')
+    }
+
+    setDeletingImportId(null)
+  }
+
+  const formatDate = (dateString: string) => {
+    return new Date(dateString).toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    })
+  }
+
+  const getPlatformColor = (platform: string) => {
+    switch (platform.toLowerCase()) {
+      case 'youtube': return 'text-red-400 bg-red-500/15'
+      case 'instagram': return 'text-pink-400 bg-pink-500/15'
+      case 'tiktok': return 'text-cyan-400 bg-cyan-500/15'
+      case 'twitter': return 'text-blue-400 bg-blue-500/15'
+      default: return 'text-slate-400 bg-slate-500/15'
     }
   }
 
@@ -130,7 +269,7 @@ export default function InboxPage() {
             ref={fileInputRef}
             type="file"
             accept=".csv"
-            onChange={handleFileUpload}
+            onChange={handleFileSelect}
             className="hidden"
             id="csv-upload"
           />
@@ -181,12 +320,56 @@ export default function InboxPage() {
         </div>
       </div>
 
+      {/* Import History */}
+      {!isLoadingImports && imports.length > 0 && (
+        <div className="card p-6">
+          <h2 className="text-lg font-bold mb-4">Import History</h2>
+          <div className="space-y-3">
+            {imports.map((imp) => (
+              <div
+                key={imp.id}
+                className="flex items-center justify-between p-4 bg-dark-tertiary rounded-xl"
+              >
+                <div className="flex items-center gap-4">
+                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${getPlatformColor(imp.platform)}`}>
+                    <MessageSquare className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="font-medium">{imp.name}</h3>
+                    <div className="flex items-center gap-3 text-xs text-slate-500">
+                      <span className="flex items-center gap-1">
+                        <Calendar className="w-3 h-3" />
+                        {formatDate(imp.created_at)}
+                      </span>
+                      <span>{imp.comment_count} comments</span>
+                      <span className="capitalize">{imp.platform}</span>
+                    </div>
+                  </div>
+                </div>
+                <button
+                  onClick={() => handleDeleteImport(imp.id)}
+                  disabled={deletingImportId === imp.id}
+                  className="p-2 text-slate-400 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
+                  title="Delete import"
+                >
+                  {deletingImportId === imp.id ? (
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                  ) : (
+                    <Trash2 className="w-5 h-5" />
+                  )}
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Coming Soon Features */}
       <div className="grid md:grid-cols-2 gap-6">
         <div className="card p-6 opacity-60">
           <div className="flex items-center gap-4 mb-4">
-            <div className="w-12 h-12 rounded-xl bg-blue-500/15 flex items-center justify-center">
-              <MessageSquare className="w-6 h-6 text-blue-400" />
+            <div className="w-12 h-12 rounded-xl bg-pink-500/15 flex items-center justify-center">
+              <MessageSquare className="w-6 h-6 text-pink-400" />
             </div>
             <div>
               <h3 className="font-semibold">Instagram Integration</h3>
@@ -213,6 +396,60 @@ export default function InboxPage() {
           </p>
         </div>
       </div>
+
+      {/* Name Import Modal */}
+      {showNameModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="card p-6 w-full max-w-md animate-in">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xl font-bold">Name Your Import</h2>
+              <button
+                onClick={() => {
+                  setShowNameModal(false)
+                  setPendingFile(null)
+                  if (fileInputRef.current) fileInputRef.current.value = ''
+                }}
+                className="text-slate-400 hover:text-white"
+              >
+                <X className="w-6 h-6" />
+              </button>
+            </div>
+
+            <p className="text-slate-400 text-sm mb-4">
+              Give this import a name so you can identify it later (e.g., "YouTube Dec 2024", "Instagram Q4").
+            </p>
+
+            <input
+              type="text"
+              value={importName}
+              onChange={(e) => setImportName(e.target.value)}
+              placeholder="Import name..."
+              className="input w-full mb-4"
+              autoFocus
+            />
+
+            <div className="flex gap-3">
+              <button
+                onClick={() => {
+                  setShowNameModal(false)
+                  setPendingFile(null)
+                  if (fileInputRef.current) fileInputRef.current.value = ''
+                }}
+                className="btn-secondary flex-1"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleFileUpload}
+                disabled={!importName.trim()}
+                className="btn-primary flex-1"
+              >
+                Import
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

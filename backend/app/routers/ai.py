@@ -11,6 +11,7 @@ from decimal import Decimal
 from datetime import datetime
 import os
 import json
+from collections import Counter
 
 from app.database import get_supabase_admin
 from app.routers.auth import get_current_user
@@ -157,7 +158,8 @@ async def cluster_comments(request: ClusterAnalysisRequest, background_tasks: Ba
     supabase = get_supabase_admin()
     
     try:
-        query = supabase.table("comments").select("id, content, platform").eq("user_id", user_id)
+        # Fetch comments with platform and import_id for filtering support
+        query = supabase.table("comments").select("id, content, platform, import_id").eq("user_id", user_id)
         
         if request.comment_ids:
             query = query.in_("id", [str(id) for id in request.comment_ids])
@@ -175,20 +177,37 @@ async def cluster_comments(request: ClusterAnalysisRequest, background_tasks: Ba
                 detail=f"Not enough comments. Need {request.min_cluster_size}, found {len(comments)}."
             )
         
-        comments_text = "\n".join([f"- {c['content']}" for c in comments[:200]])
+        # Build comment text for AI with IDs for tracking
+        comments_for_ai = []
+        for i, c in enumerate(comments[:200]):
+            comments_for_ai.append(f"[{i}] {c['content']}")
+        comments_text = "\n".join(comments_for_ai)
         
         system_prompt = """You are an expert at analyzing audience feedback for content creators.
-Group similar comments and provide actionable insights."""
+Group similar comments and provide actionable insights.
+IMPORTANT: In sample_comment_indices, return the numeric indices [0], [1], etc. of the comments that belong to each cluster."""
 
         prompt = f"""Analyze these comments and group into {request.num_clusters} themes:
 
 {comments_text}
 
-Respond in JSON:
-{{"clusters": [{{"theme": "string", "summary": "string", "sample_comments": ["string"], "content_ideas": [{{"title": "string", "description": "string", "content_type": "video"}}]}}]}}"""
+Respond in JSON format:
+{{"clusters": [
+  {{
+    "theme": "Theme Name",
+    "summary": "Brief summary of what viewers are asking about",
+    "sample_comment_indices": [0, 1, 2],
+    "content_ideas": [
+      {{"title": "Video Title Idea", "description": "Description", "content_type": "video"}}
+    ]
+  }}
+]}}
+
+Make sure sample_comment_indices contains the [N] numbers from the comments above."""
 
         response_text = await call_groq(prompt, system_prompt, max_tokens=3000)
         
+        # Parse AI response
         try:
             cleaned = response_text.strip()
             if cleaned.startswith("```"):
@@ -198,29 +217,119 @@ Respond in JSON:
             cleaned = cleaned.strip()
             result = json.loads(cleaned)
             clusters_data = result.get("clusters", [])
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            print(f"JSON Parse Error: {e}")
+            print(f"Response was: {response_text[:500]}")
             raise HTTPException(status_code=500, detail="Failed to parse AI response")
         
         created_clusters = []
+        
         for cluster_data in clusters_data:
+            # Get comment indices from AI response
+            comment_indices = cluster_data.get("sample_comment_indices", [])
+            
+            # Map indices to actual comments
+            cluster_comments_list = []
+            cluster_comment_ids = []
+            cluster_platforms = []
+            cluster_import_ids = []
+            
+            for idx in comment_indices:
+                if isinstance(idx, int) and 0 <= idx < len(comments):
+                    comment = comments[idx]
+                    cluster_comments_list.append(comment["content"])
+                    cluster_comment_ids.append(comment["id"])
+                    if comment.get("platform"):
+                        cluster_platforms.append(comment["platform"])
+                    if comment.get("import_id"):
+                        cluster_import_ids.append(comment["import_id"])
+            
+            # If AI didn't return indices, use sample_comments text matching as fallback
+            if not cluster_comments_list:
+                sample_texts = cluster_data.get("sample_comments", [])
+                for sample in sample_texts[:5]:
+                    for comment in comments:
+                        if sample.lower() in comment["content"].lower() or comment["content"].lower() in sample.lower():
+                            cluster_comments_list.append(comment["content"])
+                            cluster_comment_ids.append(comment["id"])
+                            if comment.get("platform"):
+                                cluster_platforms.append(comment["platform"])
+                            if comment.get("import_id"):
+                                cluster_import_ids.append(comment["import_id"])
+                            break
+            
+            # Determine primary platform (most common)
+            primary_platform = None
+            unique_platforms = list(set(cluster_platforms))
+            if cluster_platforms:
+                platform_counts = Counter(cluster_platforms)
+                primary_platform = platform_counts.most_common(1)[0][0]
+            
+            # Get unique import_ids
+            unique_import_ids = list(set([str(iid) for iid in cluster_import_ids if iid]))
+            
+            # Format content ideas
             content_ideas = cluster_data.get("content_ideas", [])
             if content_ideas and isinstance(content_ideas[0], dict):
-                content_ideas = [{"title": i.get("title", ""), "description": i.get("description", ""), "content_type": i.get("content_type", "video")} for i in content_ideas]
+                content_ideas = [
+                    {
+                        "title": i.get("title", ""),
+                        "description": i.get("description", ""),
+                        "content_type": i.get("content_type", "video")
+                    } for i in content_ideas
+                ]
             
+            # Create cluster with platform/import metadata
             cluster_insert = {
                 "user_id": user_id,
                 "theme": cluster_data.get("theme", "Theme"),
                 "summary": cluster_data.get("summary", ""),
-                "sample_comments": cluster_data.get("sample_comments", []),
+                "sample_comments": cluster_comments_list[:5],
                 "content_ideas": content_ideas,
-                "comment_count": len(cluster_data.get("sample_comments", [])),
-                "is_active": True
+                "comment_count": len(cluster_comment_ids) if cluster_comment_ids else len(cluster_data.get("sample_comments", [])),
+                "is_active": True,
+                "primary_platform": primary_platform,
+                "platforms": unique_platforms,
+                "import_ids": unique_import_ids
             }
             
             insert_response = supabase.table("clusters").insert(cluster_insert).execute()
+            
             if insert_response.data:
-                created_clusters.append(ClusterResponse(**insert_response.data[0]))
+                cluster_id = insert_response.data[0]["id"]
+                
+                # Create cluster_comments relationships
+                if cluster_comment_ids:
+                    cluster_comment_relations = [
+                        {"cluster_id": cluster_id, "comment_id": cid}
+                        for cid in cluster_comment_ids
+                    ]
+                    try:
+                        supabase.table("cluster_comments").insert(cluster_comment_relations).execute()
+                    except Exception as e:
+                        print(f"Warning: Failed to insert cluster_comments: {e}")
+                
+                # Update comments with cluster_id
+                if cluster_comment_ids:
+                    try:
+                        supabase.table("comments").update({"cluster_id": cluster_id}).in_("id", cluster_comment_ids).execute()
+                    except Exception as e:
+                        print(f"Warning: Failed to update comments with cluster_id: {e}")
+                
+                created_clusters.append(ClusterResponse(
+                    id=insert_response.data[0]["id"],
+                    user_id=insert_response.data[0]["user_id"],
+                    theme=insert_response.data[0]["theme"],
+                    summary=insert_response.data[0].get("summary"),
+                    comment_count=insert_response.data[0]["comment_count"],
+                    sample_comments=insert_response.data[0].get("sample_comments", []),
+                    content_ideas=insert_response.data[0].get("content_ideas", []),
+                    is_active=insert_response.data[0]["is_active"],
+                    created_at=insert_response.data[0]["created_at"],
+                    updated_at=insert_response.data[0].get("updated_at", insert_response.data[0]["created_at"])
+                ))
         
+        # Mark all fetched comments as processed
         comment_ids = [c["id"] for c in comments]
         supabase.table("comments").update({"is_processed": True}).in_("id", comment_ids).execute()
         
@@ -233,6 +342,7 @@ Respond in JSON:
     except HTTPException:
         raise
     except Exception as e:
+        print(f"Cluster error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
 
 
