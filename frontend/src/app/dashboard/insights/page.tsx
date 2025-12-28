@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { createBrowserClient } from '@/lib/supabase'
 import { 
   Sparkles, 
@@ -21,21 +21,22 @@ import Link from 'next/link'
 import PaywallModal from '@/components/PaywallModal'
 import ConfirmModal from '@/components/ConfirmModal'
 
-interface Cluster {
+interface ClusterWithStats {
   id: string
   theme: string
   summary: string | null
-  comment_count: number
   sample_comments: string[]
   content_ideas: Array<{
     title: string
     description: string
     content_type: string
   }>
-  primary_platform: string | null
+  created_at: string
+  total_comment_count: number
+  platform_breakdown: Record<string, number>
+  filtered_comment_count: number
   platforms: string[]
   import_ids: string[]
-  created_at: string
 }
 
 interface Import {
@@ -43,24 +44,31 @@ interface Import {
   name: string
   platform: string
   comment_count: number
-  created_at: string
+}
+
+interface ClustersMeta {
+  total_clusters: number
+  filter_applied: {
+    platform: string | null
+    import_id: string | null
+  }
+  available_platforms: string[]
+  available_imports: Import[]
 }
 
 interface CommentStats {
   total: number
   unprocessed: number
-  byPlatform: Record<string, number>
 }
 
 export default function InsightsPage() {
-  const [clusters, setClusters] = useState<Cluster[]>([])
-  const [filteredClusters, setFilteredClusters] = useState<Cluster[]>([])
-  const [imports, setImports] = useState<Import[]>([])
-  const [stats, setStats] = useState<CommentStats>({ total: 0, unprocessed: 0, byPlatform: {} })
+  const [clusters, setClusters] = useState<ClusterWithStats[]>([])
+  const [meta, setMeta] = useState<ClustersMeta | null>(null)
+  const [stats, setStats] = useState<CommentStats>({ total: 0, unprocessed: 0 })
   const [isLoading, setIsLoading] = useState(true)
   const [isGenerating, setIsGenerating] = useState(false)
   const [isResetting, setIsResetting] = useState(false)
-  const [selectedCluster, setSelectedCluster] = useState<Cluster | null>(null)
+  const [selectedCluster, setSelectedCluster] = useState<ClusterWithStats | null>(null)
   const [showPaywall, setShowPaywall] = useState(false)
   const [showNoCommentsModal, setShowNoCommentsModal] = useState(false)
   const [showResetModal, setShowResetModal] = useState(false)
@@ -69,31 +77,49 @@ export default function InsightsPage() {
   const [selectedPlatform, setSelectedPlatform] = useState<string>('all')
   const [selectedImport, setSelectedImport] = useState<string>('all')
 
-  useEffect(() => {
-    fetchData()
-  }, [])
+  const fetchClusters = useCallback(async () => {
+    try {
+      const supabase = createBrowserClient()
+      const { data: { session } } = await supabase.auth.getSession()
+      
+      if (!session?.access_token) {
+        setIsLoading(false)
+        return
+      }
 
-  useEffect(() => {
-    applyFilters()
-  }, [clusters, selectedPlatform, selectedImport])
+      // Build query params
+      const params = new URLSearchParams()
+      if (selectedPlatform !== 'all') {
+        params.append('platform', selectedPlatform)
+      }
+      if (selectedImport !== 'all') {
+        params.append('import_id', selectedImport)
+      }
 
-  const fetchData = async () => {
+      const url = `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/ai/clusters-with-stats${params.toString() ? '?' + params.toString() : ''}`
+      
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${session.access_token}`
+        }
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        setClusters(data.clusters || [])
+        setMeta(data.meta || null)
+      } else {
+        console.error('Failed to fetch clusters:', response.status)
+        setClusters([])
+      }
+    } catch (error) {
+      console.error('Error fetching clusters:', error)
+      setClusters([])
+    }
+  }, [selectedPlatform, selectedImport])
+
+  const fetchCommentStats = useCallback(async () => {
     const supabase = createBrowserClient()
-
-    const { data: clustersData } = await supabase
-      .from('clusters')
-      .select('*')
-      .eq('is_active', true)
-      .order('comment_count', { ascending: false })
-
-    setClusters(clustersData || [])
-
-    const { data: importsData } = await supabase
-      .from('imports')
-      .select('*')
-      .order('created_at', { ascending: false })
-
-    setImports(importsData || [])
 
     const { count: total } = await supabase
       .from('comments')
@@ -104,91 +130,28 @@ export default function InsightsPage() {
       .select('*', { count: 'exact', head: true })
       .eq('is_processed', false)
 
-    const { data: platformData } = await supabase
-      .from('comments')
-      .select('platform')
-    
-    const byPlatform: Record<string, number> = {}
-    platformData?.forEach(c => {
-      byPlatform[c.platform] = (byPlatform[c.platform] || 0) + 1
-    })
-
     setStats({
       total: total || 0,
-      unprocessed: unprocessed || 0,
-      byPlatform
+      unprocessed: unprocessed || 0
     })
+  }, [])
 
+  const fetchData = useCallback(async () => {
+    setIsLoading(true)
+    await Promise.all([fetchClusters(), fetchCommentStats()])
     setIsLoading(false)
-  }
+  }, [fetchClusters, fetchCommentStats])
 
-  const applyFilters = () => {
-    let filtered = [...clusters]
+  useEffect(() => {
+    fetchData()
+  }, [fetchData])
 
-    if (selectedPlatform !== 'all') {
-      filtered = filtered.filter(c => 
-        c.platforms?.includes(selectedPlatform) || c.primary_platform === selectedPlatform
-      )
+  // Refetch clusters when filters change
+  useEffect(() => {
+    if (!isLoading) {
+      fetchClusters()
     }
-
-    if (selectedImport !== 'all') {
-      filtered = filtered.filter(c => 
-        c.import_ids?.includes(selectedImport)
-      )
-    }
-
-    const consolidated = consolidateThemes(filtered)
-    setFilteredClusters(consolidated)
-  }
-
-  const consolidateThemes = (clusterList: Cluster[]): Cluster[] => {
-    const themeMap = new Map<string, Cluster>()
-
-    clusterList.forEach(cluster => {
-      const normalizedTheme = cluster.theme.toLowerCase().trim()
-      
-      let matchedKey: string | null = null
-      for (const key of Array.from(themeMap.keys())) {
-        if (areSimilarThemes(normalizedTheme, key)) {
-          matchedKey = key
-          break
-        }
-      }
-
-      if (matchedKey) {
-        const existing = themeMap.get(matchedKey)!
-        const mergedPlatforms = Array.from(new Set([...(existing.platforms || []), ...(cluster.platforms || [])]))
-        const mergedImportIds = Array.from(new Set([...(existing.import_ids || []), ...(cluster.import_ids || [])]))
-        
-        themeMap.set(matchedKey, {
-          ...existing,
-          comment_count: existing.comment_count + cluster.comment_count,
-          sample_comments: [...existing.sample_comments, ...cluster.sample_comments].slice(0, 5),
-          content_ideas: [...existing.content_ideas, ...cluster.content_ideas].slice(0, 4),
-          platforms: mergedPlatforms,
-          import_ids: mergedImportIds
-        })
-      } else {
-        themeMap.set(normalizedTheme, { ...cluster })
-      }
-    })
-
-    return Array.from(themeMap.values()).sort((a, b) => b.comment_count - a.comment_count)
-  }
-
-  const areSimilarThemes = (theme1: string, theme2: string): boolean => {
-    if (theme1 === theme2) return true
-    if (theme1.includes(theme2) || theme2.includes(theme1)) return true
-    
-    const words1 = theme1.split(/\s+/).filter(w => w.length > 3)
-    const words2 = theme2.split(/\s+/).filter(w => w.length > 3)
-    
-    const commonWords = words1.filter(w => 
-      words2.some(w2 => w2.includes(w) || w.includes(w2))
-    )
-    
-    return commonWords.length >= 2
-  }
+  }, [selectedPlatform, selectedImport])
 
   const handleGenerateInsights = async () => {
     if (stats.unprocessed < 3) {
@@ -227,6 +190,10 @@ export default function InsightsPage() {
 
       const data = await response.json()
       toast.success(`Generated ${data.clusters_created} insight clusters!`)
+      
+      // Reset filters and refetch
+      setSelectedPlatform('all')
+      setSelectedImport('all')
       fetchData()
     } catch (error) {
       toast.error('Failed to generate insights. Make sure the backend is running.')
@@ -265,7 +232,8 @@ export default function InsightsPage() {
 
         toast.success('Insights reset! You can now regenerate them.')
         setClusters([])
-        setFilteredClusters([])
+        setSelectedPlatform('all')
+        setSelectedImport('all')
         fetchData()
       }
     } catch (error) {
@@ -276,7 +244,32 @@ export default function InsightsPage() {
     setShowResetModal(false)
   }
 
-  const platforms = Object.keys(stats.byPlatform)
+  const clearFilters = () => {
+    setSelectedPlatform('all')
+    setSelectedImport('all')
+  }
+
+  const hasActiveFilters = selectedPlatform !== 'all' || selectedImport !== 'all'
+
+  // Get platform display info
+  const getPlatformStyle = (platform: string) => {
+    switch (platform) {
+      case 'youtube':
+        return 'bg-red-500/15 text-red-400'
+      case 'instagram':
+        return 'bg-pink-500/15 text-pink-400'
+      case 'tiktok':
+        return 'bg-cyan-500/15 text-cyan-400'
+      default:
+        return 'bg-slate-500/15 text-slate-400'
+    }
+  }
+
+  // Calculate total comments for current filter from meta
+  const getFilteredCommentCount = () => {
+    if (!meta) return 0
+    return clusters.reduce((sum, c) => sum + c.filtered_comment_count, 0)
+  }
 
   if (isLoading) {
     return (
@@ -364,15 +357,17 @@ export default function InsightsPage() {
               <Lightbulb className="w-5 h-5 text-green-400" />
             </div>
             <div>
-              <p className="text-2xl font-bold">{filteredClusters.length}</p>
-              <p className="text-xs text-slate-500">Insight Clusters</p>
+              <p className="text-2xl font-bold">{meta?.total_clusters || 0}</p>
+              <p className="text-xs text-slate-500">
+                {hasActiveFilters ? 'Matching Clusters' : 'Insight Clusters'}
+              </p>
             </div>
           </div>
         </div>
       </div>
 
       {/* Filters */}
-      {(clusters.length > 0 || imports.length > 0) && (
+      {meta && (meta.available_platforms.length > 0 || meta.available_imports.length > 0) && (
         <div className="card p-4">
           <div className="flex flex-wrap items-center gap-4">
             <div className="flex items-center gap-2">
@@ -380,7 +375,7 @@ export default function InsightsPage() {
               <span className="text-sm text-slate-400">Filters:</span>
             </div>
 
-            {platforms.length > 0 && (
+            {meta.available_platforms.length > 0 && (
               <div>
                 <select
                   value={selectedPlatform}
@@ -388,16 +383,16 @@ export default function InsightsPage() {
                   className="input text-sm py-1.5"
                 >
                   <option value="all">All Platforms</option>
-                  {platforms.map(platform => (
+                  {meta.available_platforms.map(platform => (
                     <option key={platform} value={platform}>
-                      {platform.charAt(0).toUpperCase() + platform.slice(1)} ({stats.byPlatform[platform]})
+                      {platform.charAt(0).toUpperCase() + platform.slice(1)}
                     </option>
                   ))}
                 </select>
               </div>
             )}
 
-            {imports.length > 0 && (
+            {meta.available_imports.length > 0 && (
               <div>
                 <select
                   value={selectedImport}
@@ -405,7 +400,7 @@ export default function InsightsPage() {
                   className="input text-sm py-1.5"
                 >
                   <option value="all">All Imports</option>
-                  {imports.map(imp => (
+                  {meta.available_imports.map(imp => (
                     <option key={imp.id} value={imp.id}>
                       {imp.name} ({imp.comment_count})
                     </option>
@@ -414,43 +409,43 @@ export default function InsightsPage() {
               </div>
             )}
 
-            {(selectedPlatform !== 'all' || selectedImport !== 'all') && (
+            {hasActiveFilters && (
               <button
-                onClick={() => {
-                  setSelectedPlatform('all')
-                  setSelectedImport('all')
-                }}
+                onClick={clearFilters}
                 className="text-xs text-primary-400 hover:text-primary-300"
               >
                 Clear filters
               </button>
+            )}
+
+            {hasActiveFilters && (
+              <span className="text-xs text-slate-500">
+                {getFilteredCommentCount()} comments in {clusters.length} clusters
+              </span>
             )}
           </div>
         </div>
       )}
 
       {/* Clusters */}
-      {filteredClusters.length === 0 ? (
+      {clusters.length === 0 ? (
         <div className="card p-12 text-center">
           <div className="w-20 h-20 rounded-2xl bg-dark-tertiary flex items-center justify-center mx-auto mb-6">
             <Sparkles className="w-10 h-10 text-slate-500" />
           </div>
           <h2 className="text-xl font-bold mb-2">
-            {clusters.length > 0 && (selectedPlatform !== 'all' || selectedImport !== 'all') 
+            {hasActiveFilters 
               ? 'No insights match your filters' 
               : 'No insights yet'}
           </h2>
           <p className="text-slate-400 mb-6 max-w-md mx-auto">
-            {clusters.length > 0 && (selectedPlatform !== 'all' || selectedImport !== 'all')
+            {hasActiveFilters
               ? 'Try adjusting your filters or generate new insights.'
               : 'Import some comments in the Inbox Brain section, then click "Generate Insights" to let AI analyze and cluster your audience feedback.'}
           </p>
-          {clusters.length > 0 && (selectedPlatform !== 'all' || selectedImport !== 'all') && (
+          {hasActiveFilters && (
             <button
-              onClick={() => {
-                setSelectedPlatform('all')
-                setSelectedImport('all')
-              }}
+              onClick={clearFilters}
               className="btn-secondary"
             >
               Clear Filters
@@ -459,9 +454,9 @@ export default function InsightsPage() {
         </div>
       ) : (
         <div className="grid md:grid-cols-2 gap-6">
-          {filteredClusters.map((cluster, index) => (
+          {clusters.map((cluster) => (
             <div
-              key={cluster.id + '-' + index}
+              key={cluster.id}
               className="card p-6 hover:border-primary-500/30 transition-all cursor-pointer"
               onClick={() => setSelectedCluster(cluster)}
             >
@@ -472,7 +467,12 @@ export default function InsightsPage() {
                   </div>
                   <div>
                     <h3 className="font-semibold">{cluster.theme}</h3>
-                    <p className="text-xs text-slate-500">{cluster.comment_count} comments</p>
+                    <p className="text-xs text-slate-500">
+                      {cluster.filtered_comment_count} comment{cluster.filtered_comment_count !== 1 ? 's' : ''}
+                      {hasActiveFilters && cluster.total_comment_count !== cluster.filtered_comment_count && (
+                        <span className="text-slate-600"> (of {cluster.total_comment_count} total)</span>
+                      )}
+                    </p>
                   </div>
                 </div>
                 <ChevronRight className="w-5 h-5 text-slate-500" />
@@ -486,15 +486,10 @@ export default function InsightsPage() {
 
               {cluster.platforms && cluster.platforms.length > 0 && (
                 <div className="flex flex-wrap gap-1 mb-3">
-                  {cluster.platforms.slice(0, 3).map((platform, i) => (
+                  {cluster.platforms.map((platform, i) => (
                     <span 
                       key={i} 
-                      className={`text-xs px-2 py-0.5 rounded ${
-                        platform === 'youtube' ? 'bg-red-500/15 text-red-400' :
-                        platform === 'instagram' ? 'bg-pink-500/15 text-pink-400' :
-                        platform === 'tiktok' ? 'bg-cyan-500/15 text-cyan-400' :
-                        'bg-slate-500/15 text-slate-400'
-                      }`}
+                      className={`text-xs px-2 py-0.5 rounded ${getPlatformStyle(platform)}`}
                     >
                       {platform}
                     </span>
@@ -526,21 +521,29 @@ export default function InsightsPage() {
             <div className="flex items-start justify-between mb-6">
               <div>
                 <h2 className="text-xl font-bold">{selectedCluster.theme}</h2>
-                <p className="text-sm text-slate-500">{selectedCluster.comment_count} comments in this cluster</p>
+                <p className="text-sm text-slate-500">
+                  {selectedCluster.filtered_comment_count} comment{selectedCluster.filtered_comment_count !== 1 ? 's' : ''} in this cluster
+                  {hasActiveFilters && selectedCluster.total_comment_count !== selectedCluster.filtered_comment_count && (
+                    <span> ({selectedCluster.total_comment_count} total)</span>
+                  )}
+                </p>
                 {selectedCluster.platforms && selectedCluster.platforms.length > 0 && (
                   <div className="flex flex-wrap gap-1 mt-2">
                     {selectedCluster.platforms.map((platform, i) => (
                       <span 
                         key={i} 
-                        className={`text-xs px-2 py-0.5 rounded ${
-                          platform === 'youtube' ? 'bg-red-500/15 text-red-400' :
-                          platform === 'instagram' ? 'bg-pink-500/15 text-pink-400' :
-                          platform === 'tiktok' ? 'bg-cyan-500/15 text-cyan-400' :
-                          'bg-slate-500/15 text-slate-400'
-                        }`}
+                        className={`text-xs px-2 py-0.5 rounded ${getPlatformStyle(platform)}`}
                       >
                         {platform}
                       </span>
+                    ))}
+                  </div>
+                )}
+                {/* Platform breakdown when no filter */}
+                {!hasActiveFilters && Object.keys(selectedCluster.platform_breakdown).length > 1 && (
+                  <div className="flex flex-wrap gap-2 mt-2 text-xs text-slate-500">
+                    {Object.entries(selectedCluster.platform_breakdown).map(([plat, count]) => (
+                      <span key={plat}>{plat}: {count}</span>
                     ))}
                   </div>
                 )}

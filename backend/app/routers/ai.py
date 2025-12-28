@@ -152,6 +152,173 @@ Write a compelling pitch email."""
         raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
 
 
+@router.get("/clusters-with-stats")
+async def get_clusters_with_stats(
+    platform: Optional[str] = None,
+    import_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get clusters with detailed statistics for intelligent filtering.
+    
+    - If platform filter is applied: returns only clusters with comments from that platform,
+      with filtered_comment_count showing only comments from that platform.
+    - If import_id filter is applied: returns only clusters with comments from that import.
+    """
+    user_id = current_user["id"]
+    supabase = get_supabase_admin()
+    
+    try:
+        # Get all active clusters for the user
+        clusters_response = supabase.table("clusters")\
+            .select("id, theme, summary, sample_comments, content_ideas, created_at, platforms, import_ids")\
+            .eq("user_id", user_id)\
+            .eq("is_active", True)\
+            .execute()
+        
+        clusters_data = clusters_response.data or []
+        
+        # Get available imports (always needed for meta)
+        imports_response = supabase.table("imports")\
+            .select("id, name, platform, comment_count")\
+            .eq("user_id", user_id)\
+            .order("created_at", desc=True)\
+            .execute()
+        
+        available_imports = imports_response.data or []
+        
+        if not clusters_data:
+            return {
+                "clusters": [],
+                "meta": {
+                    "total_clusters": 0,
+                    "filter_applied": {
+                        "platform": platform,
+                        "import_id": import_id
+                    },
+                    "available_platforms": [],
+                    "available_imports": available_imports
+                }
+            }
+        
+        # Get platform breakdown for each cluster from cluster_comments
+        cluster_ids = [c["id"] for c in clusters_data]
+        
+        # Get all cluster_comments relationships
+        cc_response = supabase.table("cluster_comments")\
+            .select("cluster_id, comment_id")\
+            .in_("cluster_id", cluster_ids)\
+            .execute()
+        
+        cluster_comments_map = {}  # cluster_id -> [comment_ids]
+        for cc in (cc_response.data or []):
+            cid = cc["cluster_id"]
+            if cid not in cluster_comments_map:
+                cluster_comments_map[cid] = []
+            cluster_comments_map[cid].append(cc["comment_id"])
+        
+        # Get all relevant comments with platform and import_id
+        all_comment_ids = []
+        for cids in cluster_comments_map.values():
+            all_comment_ids.extend(cids)
+        
+        if all_comment_ids:
+            comments_response = supabase.table("comments")\
+                .select("id, platform, import_id")\
+                .in_("id", all_comment_ids)\
+                .execute()
+            comments_data = comments_response.data or []
+        else:
+            comments_data = []
+        
+        comments_lookup = {c["id"]: c for c in comments_data}
+        
+        # Build platform breakdown per cluster
+        cluster_breakdowns = {}  # cluster_id -> {platforms: {}, import_ids: set}
+        all_platforms_set = set()
+        
+        for cluster_id, comment_ids in cluster_comments_map.items():
+            breakdown = {"platforms": {}, "import_ids": set()}
+            for comment_id in comment_ids:
+                comment = comments_lookup.get(comment_id)
+                if comment:
+                    plat = comment.get("platform", "other")
+                    breakdown["platforms"][plat] = breakdown["platforms"].get(plat, 0) + 1
+                    all_platforms_set.add(plat)
+                    if comment.get("import_id"):
+                        breakdown["import_ids"].add(comment["import_id"])
+            cluster_breakdowns[cluster_id] = breakdown
+        
+        # Build response clusters with filtering
+        result_clusters = []
+        
+        for cluster in clusters_data:
+            cluster_id = cluster["id"]
+            breakdown = cluster_breakdowns.get(cluster_id, {"platforms": {}, "import_ids": set()})
+            
+            platform_breakdown = breakdown["platforms"]
+            cluster_import_ids = list(breakdown["import_ids"])
+            
+            total_count = sum(platform_breakdown.values())
+            
+            # Apply platform filter
+            if platform:
+                filtered_count = platform_breakdown.get(platform, 0)
+                if filtered_count == 0:
+                    continue  # Skip clusters with no comments from this platform
+                display_platforms = [platform]
+            else:
+                filtered_count = total_count
+                display_platforms = list(platform_breakdown.keys())
+            
+            # Apply import_id filter
+            if import_id:
+                if import_id not in cluster_import_ids:
+                    continue  # Skip clusters with no comments from this import
+                # Recalculate filtered_count for this specific import
+                # We need to count comments from this import only
+                import_comment_count = 0
+                for comment_id in cluster_comments_map.get(cluster_id, []):
+                    comment = comments_lookup.get(comment_id)
+                    if comment and comment.get("import_id") == import_id:
+                        import_comment_count += 1
+                filtered_count = import_comment_count
+            
+            result_clusters.append({
+                "id": cluster_id,
+                "theme": cluster["theme"],
+                "summary": cluster.get("summary"),
+                "sample_comments": cluster.get("sample_comments", []),
+                "content_ideas": cluster.get("content_ideas", []),
+                "created_at": cluster["created_at"],
+                "total_comment_count": total_count,
+                "platform_breakdown": platform_breakdown,
+                "filtered_comment_count": filtered_count,
+                "platforms": display_platforms,
+                "import_ids": cluster_import_ids
+            })
+        
+        # Sort by filtered_comment_count descending
+        result_clusters.sort(key=lambda x: x["filtered_comment_count"], reverse=True)
+        
+        return {
+            "clusters": result_clusters,
+            "meta": {
+                "total_clusters": len(result_clusters),
+                "filter_applied": {
+                    "platform": platform,
+                    "import_id": import_id
+                },
+                "available_platforms": sorted(list(all_platforms_set)),
+                "available_imports": available_imports
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error in clusters-with-stats: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch clusters: {str(e)}")
+
+
 @router.post("/cluster-comments", response_model=ClusterAnalysisResponse)
 async def cluster_comments(request: ClusterAnalysisRequest, background_tasks: BackgroundTasks, current_user: dict = Depends(verify_subscription)):
     user_id = current_user["id"]
