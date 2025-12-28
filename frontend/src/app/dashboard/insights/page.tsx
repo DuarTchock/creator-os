@@ -87,7 +87,7 @@ export default function InsightsPage() {
       const supabase = createBrowserClient()
       const { data: { session } } = await supabase.auth.getSession()
       
-      const response = await fetch('http://localhost:8000/api/ai/cluster-comments', {
+    const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/ai/cluster-comments`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
