@@ -1,6 +1,7 @@
 """
 AI router - Pitch generation and comment clustering using Groq (Llama 3.3)
 Uses admin client with manual user_id filtering for security
+Requires active subscription or free trial
 """
 
 from fastapi import APIRouter, HTTPException, Depends, status, BackgroundTasks
@@ -13,6 +14,7 @@ import json
 
 from app.database import get_supabase_admin
 from app.routers.auth import get_current_user
+from app.middleware.subscription import check_subscription
 from app.schemas import (
     PitchGenerateRequest,
     PitchGenerateResponse,
@@ -32,6 +34,24 @@ GROQ_MODEL = "llama-3.3-70b-versatile"
 
 def get_groq_api_key() -> str:
     return os.getenv("GROQ_API_KEY", "")
+
+
+async def verify_subscription(current_user: dict = Depends(get_current_user)):
+    """Verify user has active subscription or is in trial"""
+    user_id = current_user["id"]
+    result = await check_subscription(user_id)
+    
+    if not result["has_access"]:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "error": "subscription_required",
+                "message": result.get("message", "Your 7-day free trial has expired. Please upgrade to continue."),
+                "upgrade_url": "/pricing"
+            }
+        )
+    
+    return current_user
 
 
 async def call_groq(prompt: str, system_prompt: str = None, max_tokens: int = 2000) -> str:
@@ -85,7 +105,7 @@ async def call_groq(prompt: str, system_prompt: str = None, max_tokens: int = 20
 
 
 @router.post("/generate-pitch", response_model=PitchGenerateResponse)
-async def generate_pitch(request: PitchGenerateRequest, current_user: dict = Depends(get_current_user)):
+async def generate_pitch(request: PitchGenerateRequest, current_user: dict = Depends(verify_subscription)):
     user_id = current_user["id"]
     supabase = get_supabase_admin()
     
@@ -132,7 +152,7 @@ Write a compelling pitch email."""
 
 
 @router.post("/cluster-comments", response_model=ClusterAnalysisResponse)
-async def cluster_comments(request: ClusterAnalysisRequest, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
+async def cluster_comments(request: ClusterAnalysisRequest, background_tasks: BackgroundTasks, current_user: dict = Depends(verify_subscription)):
     user_id = current_user["id"]
     supabase = get_supabase_admin()
     
@@ -217,7 +237,7 @@ Respond in JSON:
 
 
 @router.post("/generate-brief", response_model=InsightBriefResponse)
-async def generate_insight_brief(request: InsightBriefRequest, current_user: dict = Depends(get_current_user)):
+async def generate_insight_brief(request: InsightBriefRequest, current_user: dict = Depends(verify_subscription)):
     user_id = current_user["id"]
     supabase = get_supabase_admin()
     
@@ -270,7 +290,7 @@ Respond in JSON:
 
 
 @router.post("/analyze-sentiment")
-async def analyze_sentiment(comment_ids: List[UUID], current_user: dict = Depends(get_current_user)):
+async def analyze_sentiment(comment_ids: List[UUID], current_user: dict = Depends(verify_subscription)):
     user_id = current_user["id"]
     supabase = get_supabase_admin()
     

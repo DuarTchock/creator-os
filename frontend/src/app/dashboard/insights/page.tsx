@@ -9,9 +9,13 @@ import {
   TrendingUp,
   Loader2,
   RefreshCw,
-  ChevronRight
+  ChevronRight,
+  Upload,
+  X
 } from 'lucide-react'
 import toast from 'react-hot-toast'
+import Link from 'next/link'
+import PaywallModal from '@/components/PaywallModal'
 
 interface Cluster {
   id: string
@@ -39,6 +43,8 @@ export default function InsightsPage() {
   const [isLoading, setIsLoading] = useState(true)
   const [isGenerating, setIsGenerating] = useState(false)
   const [selectedCluster, setSelectedCluster] = useState<Cluster | null>(null)
+  const [showPaywall, setShowPaywall] = useState(false)
+  const [showNoCommentsModal, setShowNoCommentsModal] = useState(false)
 
   useEffect(() => {
     fetchData()
@@ -76,8 +82,9 @@ export default function InsightsPage() {
   }
 
   const handleGenerateInsights = async () => {
+    // Show modal if not enough unprocessed comments
     if (stats.unprocessed < 3) {
-      toast.error('Need at least 3 unprocessed comments to generate insights')
+      setShowNoCommentsModal(true)
       return
     }
 
@@ -87,7 +94,7 @@ export default function InsightsPage() {
       const supabase = createBrowserClient()
       const { data: { session } } = await supabase.auth.getSession()
       
-    const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/ai/cluster-comments`, {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/ai/cluster-comments`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -98,6 +105,13 @@ export default function InsightsPage() {
           min_cluster_size: 2
         })
       })
+
+      // Check for 402 Payment Required - show paywall
+      if (response.status === 402) {
+        setShowPaywall(true)
+        setIsGenerating(false)
+        return
+      }
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}))
@@ -135,7 +149,7 @@ export default function InsightsPage() {
         </div>
         <button
           onClick={handleGenerateInsights}
-          disabled={isGenerating || stats.unprocessed < 5}
+          disabled={isGenerating}
           className="btn-primary flex items-center gap-2"
         >
           {isGenerating ? (
@@ -306,6 +320,58 @@ export default function InsightsPage() {
           </div>
         </div>
       )}
+
+      {/* No Comments Modal */}
+      {showNoCommentsModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="card p-6 w-full max-w-md animate-in">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xl font-bold">No New Comments</h2>
+              <button
+                onClick={() => setShowNoCommentsModal(false)}
+                className="text-slate-400 hover:text-white"
+              >
+                <X className="w-6 h-6" />
+              </button>
+            </div>
+
+            <div className="text-center py-4">
+              <div className="w-16 h-16 rounded-2xl bg-yellow-500/15 flex items-center justify-center mx-auto mb-4">
+                <MessageSquare className="w-8 h-8 text-yellow-400" />
+              </div>
+              <p className="text-slate-400 mb-6">
+                {stats.unprocessed === 0 
+                  ? "All comments have been analyzed. Import new comments to generate fresh insights."
+                  : `You have ${stats.unprocessed} unprocessed comment${stats.unprocessed === 1 ? '' : 's'}. Need at least 3 to generate meaningful insights.`
+                }
+              </p>
+              
+              <div className="flex flex-col gap-3">
+                <Link
+                  href="/dashboard/inbox"
+                  className="btn-primary w-full flex items-center justify-center gap-2"
+                >
+                  <Upload className="w-5 h-5" />
+                  Go to Inbox Brain
+                </Link>
+                <button
+                  onClick={() => setShowNoCommentsModal(false)}
+                  className="btn-secondary w-full"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Paywall Modal */}
+      <PaywallModal
+        isOpen={showPaywall}
+        trigger="feature_blocked"
+        onClose={() => setShowPaywall(false)}
+      />
     </div>
   )
 }

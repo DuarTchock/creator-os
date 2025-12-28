@@ -17,6 +17,7 @@ import {
   Sparkles
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import PaywallModal from '@/components/PaywallModal'
 
 const navigation = [
   { name: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
@@ -36,6 +37,8 @@ export default function DashboardLayout({
   const { user, setUser, setLoading } = useUserStore()
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
+  const [trialStatus, setTrialStatus] = useState<any>(null)
+  const [showPaywall, setShowPaywall] = useState(false)
 
   useEffect(() => {
     const checkAuth = async () => {
@@ -62,6 +65,27 @@ export default function DashboardLayout({
         avatar_url: profile?.avatar_url || null,
         subscription_tier: profile?.subscription_tier || 'free',
       })
+
+      // Check trial status
+      try {
+        const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/stripe/trial-status`, {
+          headers: {
+            'Authorization': `Bearer ${session.access_token}`
+          }
+        })
+        
+        if (response.ok) {
+          const data = await response.json()
+          setTrialStatus(data)
+          
+          // Show paywall if trial expired and no subscription
+          if (!data.has_access) {
+            setShowPaywall(true)
+          }
+        }
+      } catch (error) {
+        console.error('Error checking trial status:', error)
+      }
       
       setIsLoading(false)
     }
@@ -120,6 +144,18 @@ export default function DashboardLayout({
               <X className="w-6 h-6" />
             </button>
           </div>
+
+          {/* Trial Banner */}
+          {trialStatus && trialStatus.reason === 'free_trial' && (
+            <div className="mx-4 mt-4 p-3 bg-primary-500/20 rounded-xl border border-primary-500/30">
+              <p className="text-primary-300 text-sm font-medium">
+                ⏰ {trialStatus.trial_days_left} days left in trial
+              </p>
+              <Link href="/pricing" className="text-primary-400 text-xs hover:underline">
+                Upgrade now →
+              </Link>
+            </div>
+          )}
 
           {/* Navigation */}
           <nav className="flex-1 p-4 space-y-1">
@@ -196,6 +232,13 @@ export default function DashboardLayout({
           {children}
         </main>
       </div>
+
+      {/* Paywall Modal */}
+      <PaywallModal
+        isOpen={showPaywall}
+        daysLeft={trialStatus?.trial_days_left}
+        onClose={() => setShowPaywall(false)}
+      />
     </div>
   )
 }

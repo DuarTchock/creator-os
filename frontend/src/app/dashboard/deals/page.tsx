@@ -16,6 +16,7 @@ import {
   Check
 } from 'lucide-react'
 import toast from 'react-hot-toast'
+import PaywallModal from '@/components/PaywallModal'
 
 interface Deal {
   id: string
@@ -47,6 +48,7 @@ export default function DealsPage() {
   const [selectedDeal, setSelectedDeal] = useState<Deal | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [draggedDeal, setDraggedDeal] = useState<Deal | null>(null)
+  const [showPaywall, setShowPaywall] = useState(false)
   const [newDeal, setNewDeal] = useState({
     brand_name: '',
     brand_email: '',
@@ -230,6 +232,14 @@ export default function DealsPage() {
           tone: pitchTone
         })
       })
+
+      // Check for 402 Payment Required - show paywall
+      if (response.status === 402) {
+        setShowPitchModal(false)
+        setShowPaywall(true)
+        setIsGeneratingPitch(false)
+        return
+      }
 
       if (!response.ok) {
         throw new Error('Failed to generate pitch')
@@ -651,6 +661,13 @@ export default function DealsPage() {
           </div>
         </div>
       )}
+
+      {/* Paywall Modal */}
+      <PaywallModal
+        isOpen={showPaywall}
+        trigger="feature_blocked"
+        onClose={() => setShowPaywall(false)}
+      />
     </div>
   )
 }

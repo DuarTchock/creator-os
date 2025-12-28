@@ -187,3 +187,14 @@ async def stripe_webhook(request: Request):
             }).eq("id", profile.data["id"]).execute()
     
     return {"status": "success"}
+
+
+@router.get("/trial-status")
+async def get_trial_status(current_user: dict = Depends(get_current_user)):
+    """Get user's trial status including days remaining"""
+    from app.middleware.subscription import check_subscription
+    
+    user_id = current_user["id"]
+    result = await check_subscription(user_id)
+    
+    return result
