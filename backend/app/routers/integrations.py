@@ -238,9 +238,17 @@ async def disconnect_youtube(current_user: dict = Depends(get_current_user)):
 @router.get("/youtube/videos")
 async def list_youtube_videos(
     current_user: dict = Depends(get_current_user),
-    max_results: int = 20
+    max_results: int = 50,
+    published_after: Optional[str] = None,
+    published_before: Optional[str] = None
 ):
-    """List videos from user's YouTube channel"""
+    """List videos from user's YouTube channel with optional date filtering
+    
+    Args:
+        max_results: Maximum number of videos to return (default 50)
+        published_after: ISO date string - only videos published after this date
+        published_before: ISO date string - only videos published before this date
+    """
     supabase = get_supabase_admin()
     
     integration = supabase.table("integrations").select("*").eq(
@@ -318,13 +326,34 @@ async def list_youtube_videos(
             videos = []
             for item in videos_data.get("items", []):
                 snippet = item["snippet"]
+                published_at = snippet["publishedAt"]
+                
+                # Apply date filters
+                if published_after:
+                    try:
+                        filter_date = datetime.fromisoformat(published_after.replace("Z", "+00:00"))
+                        video_date = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+                        if video_date < filter_date:
+                            continue
+                    except:
+                        pass
+                
+                if published_before:
+                    try:
+                        filter_date = datetime.fromisoformat(published_before.replace("Z", "+00:00"))
+                        video_date = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+                        if video_date > filter_date:
+                            continue
+                    except:
+                        pass
+                
                 description = snippet.get("description", "")
                 videos.append({
                     "video_id": snippet["resourceId"]["videoId"],
                     "title": snippet["title"],
                     "description": description[:150] + "..." if len(description) > 150 else description,
                     "thumbnail": snippet["thumbnails"].get("medium", {}).get("url") or snippet["thumbnails"].get("default", {}).get("url"),
-                    "published_at": snippet["publishedAt"]
+                    "published_at": published_at
                 })
             
             return {

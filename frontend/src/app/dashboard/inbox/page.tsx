@@ -18,7 +18,8 @@ import {
   ExternalLink,
   Check,
   Link2,
-  Unlink
+  Unlink,
+  ChevronDown
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import ConfirmModal from '@/components/ConfirmModal'
@@ -46,6 +47,8 @@ interface YouTubeStatus {
   account_email?: string
   last_sync_at?: string
 }
+
+type DateRangeOption = 'week' | 'month' | '3months' | 'year' | 'all' | 'custom'
 
 export default function InboxPage() {
   const searchParams = useSearchParams()
@@ -75,6 +78,11 @@ export default function InboxPage() {
   const [youtubeImportName, setYoutubeImportName] = useState('')
   const [showDisconnectModal, setShowDisconnectModal] = useState(false)
   const [isDisconnecting, setIsDisconnecting] = useState(false)
+  
+  // Date filter state
+  const [dateRange, setDateRange] = useState<DateRangeOption>('month')
+  const [customStartDate, setCustomStartDate] = useState('')
+  const [customEndDate, setCustomEndDate] = useState('')
 
   useEffect(() => {
     fetchImports()
@@ -87,7 +95,6 @@ export default function InboxPage() {
     if (success === 'youtube') {
       toast.success('YouTube connected successfully!')
       fetchYouTubeStatus()
-      // Clean URL
       window.history.replaceState({}, '', '/dashboard/inbox')
     } else if (error) {
       toast.error(`Connection failed: ${error}`)
@@ -96,7 +103,67 @@ export default function InboxPage() {
   }, [searchParams])
 
   // ============================================
-  // CSV Upload Functions (existing)
+  // Date Filter Helpers
+  // ============================================
+
+  const getDateRangeParams = (): { published_after?: string; published_before?: string } => {
+    const now = new Date()
+    let published_after: string | undefined
+    let published_before: string | undefined
+
+    switch (dateRange) {
+      case 'week':
+        const weekAgo = new Date(now)
+        weekAgo.setDate(weekAgo.getDate() - 7)
+        published_after = weekAgo.toISOString()
+        break
+      case 'month':
+        const monthAgo = new Date(now)
+        monthAgo.setMonth(monthAgo.getMonth() - 1)
+        published_after = monthAgo.toISOString()
+        break
+      case '3months':
+        const threeMonthsAgo = new Date(now)
+        threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3)
+        published_after = threeMonthsAgo.toISOString()
+        break
+      case 'year':
+        const yearAgo = new Date(now)
+        yearAgo.setFullYear(yearAgo.getFullYear() - 1)
+        published_after = yearAgo.toISOString()
+        break
+      case 'custom':
+        if (customStartDate) {
+          published_after = new Date(customStartDate).toISOString()
+        }
+        if (customEndDate) {
+          const endDate = new Date(customEndDate)
+          endDate.setHours(23, 59, 59, 999)
+          published_before = endDate.toISOString()
+        }
+        break
+      case 'all':
+      default:
+        break
+    }
+
+    return { published_after, published_before }
+  }
+
+  const getDateRangeLabel = (): string => {
+    switch (dateRange) {
+      case 'week': return 'Last 7 days'
+      case 'month': return 'Last 30 days'
+      case '3months': return 'Last 3 months'
+      case 'year': return 'Last year'
+      case 'all': return 'All time'
+      case 'custom': return 'Custom range'
+      default: return 'Select range'
+    }
+  }
+
+  // ============================================
+  // CSV Upload Functions
   // ============================================
 
   const fetchImports = async () => {
@@ -374,17 +441,31 @@ export default function InboxPage() {
     setShowDisconnectModal(false)
   }
 
-  const handleOpenYouTubeModal = async () => {
+  const handleOpenYouTubeModal = () => {
     setShowYouTubeModal(true)
-    setIsLoadingVideos(true)
+    setYoutubeVideos([])
+    setSelectedVideos(new Set())
+    setDateRange('month')
+    setCustomStartDate('')
+    setCustomEndDate('')
     setYoutubeImportName(`YouTube ${new Date().toLocaleDateString('en-US', { month: 'short', year: 'numeric' })}`)
+  }
+
+  const fetchYouTubeVideos = async () => {
+    setIsLoadingVideos(true)
     
     try {
       const supabase = createBrowserClient()
       const { data: { session } } = await supabase.auth.getSession()
       
+      const { published_after, published_before } = getDateRangeParams()
+      
+      const params = new URLSearchParams({ max_results: '50' })
+      if (published_after) params.append('published_after', published_after)
+      if (published_before) params.append('published_before', published_before)
+      
       const response = await fetch(
-        `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/integrations/youtube/videos?max_results=20`,
+        `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/integrations/youtube/videos?${params}`,
         {
           headers: { 'Authorization': `Bearer ${session?.access_token}` }
         }
@@ -393,6 +474,7 @@ export default function InboxPage() {
       if (response.ok) {
         const data = await response.json()
         setYoutubeVideos(data.videos || [])
+        setSelectedVideos(new Set())
       } else {
         toast.error('Failed to fetch videos')
       }
@@ -762,12 +844,13 @@ export default function InboxPage() {
             <div className="flex items-center justify-between mb-4">
               <div>
                 <h2 className="text-xl font-bold">Import YouTube Comments</h2>
-                <p className="text-sm text-slate-400">Select videos to import comments from</p>
+                <p className="text-sm text-slate-400">Select a date range and videos to import comments from</p>
               </div>
               <button
                 onClick={() => {
                   setShowYouTubeModal(false)
                   setSelectedVideos(new Set())
+                  setYoutubeVideos([])
                 }}
                 className="text-slate-400 hover:text-white"
               >
@@ -787,6 +870,76 @@ export default function InboxPage() {
               />
             </div>
 
+            {/* Date Range Selector */}
+            <div className="mb-4 p-4 bg-dark-tertiary rounded-xl">
+              <label className="text-sm text-slate-400 mb-2 block">Date Range</label>
+              <div className="flex flex-wrap gap-2 mb-3">
+                {[
+                  { value: 'week', label: 'Last 7 days' },
+                  { value: 'month', label: 'Last 30 days' },
+                  { value: '3months', label: 'Last 3 months' },
+                  { value: 'year', label: 'Last year' },
+                  { value: 'all', label: 'All time' },
+                  { value: 'custom', label: 'Custom' },
+                ].map((option) => (
+                  <button
+                    key={option.value}
+                    onClick={() => setDateRange(option.value as DateRangeOption)}
+                    className={`px-3 py-1.5 rounded-lg text-sm transition-colors ${
+                      dateRange === option.value
+                        ? 'bg-primary-500 text-white'
+                        : 'bg-dark-bg text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+              
+              {/* Custom Date Inputs */}
+              {dateRange === 'custom' && (
+                <div className="flex gap-3 mt-3">
+                  <div className="flex-1">
+                    <label className="text-xs text-slate-500 mb-1 block">From</label>
+                    <input
+                      type="date"
+                      value={customStartDate}
+                      onChange={(e) => setCustomStartDate(e.target.value)}
+                      className="input w-full text-sm"
+                    />
+                  </div>
+                  <div className="flex-1">
+                    <label className="text-xs text-slate-500 mb-1 block">To</label>
+                    <input
+                      type="date"
+                      value={customEndDate}
+                      onChange={(e) => setCustomEndDate(e.target.value)}
+                      className="input w-full text-sm"
+                    />
+                  </div>
+                </div>
+              )}
+              
+              {/* Fetch Videos Button */}
+              <button
+                onClick={fetchYouTubeVideos}
+                disabled={isLoadingVideos || (dateRange === 'custom' && !customStartDate && !customEndDate)}
+                className="btn-secondary w-full mt-3 flex items-center justify-center gap-2"
+              >
+                {isLoadingVideos ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Loading videos...
+                  </>
+                ) : (
+                  <>
+                    <Calendar className="w-4 h-4" />
+                    Load Videos
+                  </>
+                )}
+              </button>
+            </div>
+
             {/* Select All */}
             {youtubeVideos.length > 0 && (
               <div className="flex items-center justify-between mb-3 pb-3 border-b border-dark-border">
@@ -803,14 +956,16 @@ export default function InboxPage() {
             )}
 
             {/* Videos List */}
-            <div className="flex-1 overflow-y-auto space-y-2 mb-4">
+            <div className="flex-1 overflow-y-auto space-y-2 mb-4 min-h-[200px]">
               {isLoadingVideos ? (
                 <div className="flex items-center justify-center py-12">
                   <Loader2 className="w-8 h-8 animate-spin text-primary-400" />
                 </div>
               ) : youtubeVideos.length === 0 ? (
                 <div className="text-center py-12 text-slate-400">
-                  No videos found in your channel
+                  <Calendar className="w-12 h-12 mx-auto mb-3 opacity-50" />
+                  <p>Select a date range and click "Load Videos"</p>
+                  <p className="text-sm text-slate-500 mt-1">Videos from your channel will appear here</p>
                 </div>
               ) : (
                 youtubeVideos.map((video) => (
@@ -869,6 +1024,7 @@ export default function InboxPage() {
                 onClick={() => {
                   setShowYouTubeModal(false)
                   setSelectedVideos(new Set())
+                  setYoutubeVideos([])
                 }}
                 className="btn-secondary flex-1"
               >
